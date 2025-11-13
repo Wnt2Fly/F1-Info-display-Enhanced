@@ -2,7 +2,7 @@
 // F1 TRACKER DEMO MODE - Cycles through all display modes
 // ============================================================
 // This is a TEMPORARY file for taking photos of all modes
-// DO NOT use this in production - use F1_Tracker_3Color.ino instead
+// DO NOT use this in production - use F1-Info-display-Enhanced.ino instead
 // ============================================================
 
 #include <WiFi.h>
@@ -438,8 +438,21 @@ void FetchCalendar() {
     }
   }
 
+  // DEMO MODE: Use last completed race for all displays (so we can get starting grid)
+  if (lastRound > 0) {
+    // Set nextRound to lastRound so demo can use previous race data
+    nextRound = lastRound;
+    nextDate = lastDate;
+    nextTime = lastTime;
+    nextGP = lastGP;
+    nextCircuit = lastCircuit;
+    nextLoc = lastLoc;
+    nextRaceEpoch = isoUtcToEpoch(lastDate, lastTime);
+    Serial.printf("[DEMO] Using previous race R%u %s for demo\n", lastRound, lastGP.c_str());
+  }
+  
   if (lastRound) Serial.printf("[DATA] Last: R%u %s\n", lastRound, lastGP.c_str());
-  if (nextRound) Serial.printf("[DATA] Next: R%u %s\n", nextRound, nextGP.c_str());
+  if (nextRound) Serial.printf("[DATA] Next (demo): R%u %s\n", nextRound, nextGP.c_str());
 }
 
 // ------------------- DRAW NEXT RACE ----------------------
@@ -629,7 +642,6 @@ void DrawLastRace(bool showResults, bool showAwaiting = false, bool showEmpty = 
   }
   
   String displayGP = lastGP;
-  drawStringBLACK(PODIUM_TEXT_CENTER_X, PODIUM_TEXT_Y, displayGP.c_str(), CENTER);
   
   if (showEmpty) {
     // Empty podium (race in progress)
@@ -637,11 +649,13 @@ void DrawLastRace(bool showResults, bool showAwaiting = false, bool showEmpty = 
     display.drawRect(PODIUM_1ST_X, PODIUM_1ST_Y, PODIUM_1ST_W, PODIUM_1ST_H, GxEPD_BLACK);
     display.drawRect(PODIUM_2ND_X, PODIUM_2ND_Y, PODIUM_2ND_W, PODIUM_2ND_H, GxEPD_BLACK);
     display.drawRect(PODIUM_3RD_X, PODIUM_3RD_Y, PODIUM_3RD_W, PODIUM_3RD_H, GxEPD_BLACK);
+    // Show GP name below empty podium
+    drawStringBLACK(PODIUM_TEXT_CENTER_X, PODIUM_TEXT_Y, displayGP.c_str(), CENTER);
     return;
   }
   
   if (showAwaiting) {
-    // "Awaiting Results" mode
+    // "Awaiting Results" mode - don't show GP name, just "Awaiting Results"
     display.drawBitmap(SCREEN_WIDTH / 2 - logoWidth / 2, PODIUM_LOGO_Y, F1_Logo, logoWidth, logoHeight, GxEPD_RED);
     display.drawRect(PODIUM_1ST_X, PODIUM_1ST_Y, PODIUM_1ST_W, PODIUM_1ST_H, GxEPD_BLACK);
     display.drawRect(PODIUM_2ND_X, PODIUM_2ND_Y, PODIUM_2ND_W, PODIUM_2ND_H, GxEPD_BLACK);
@@ -679,6 +693,8 @@ void DrawLastRace(bool showResults, bool showAwaiting = false, bool showEmpty = 
           drawStringRED(SCREEN_WIDTH / 2 - 1, PODIUM_NAME_1ST_Y, abbrev0.c_str(), CENTER);
           drawStringRED(SCREEN_WIDTH / 2 + PODIUM_NAME_2ND_X_OFFSET, PODIUM_NAME_2ND_Y, abbrev1.c_str(), LEFT);
           drawStringRED(SCREEN_WIDTH / 2 + PODIUM_NAME_3RD_X_OFFSET, PODIUM_NAME_3RD_Y, abbrev2.c_str(), LEFT);
+          // Show GP name below podium
+          drawStringBLACK(PODIUM_TEXT_CENTER_X, PODIUM_TEXT_Y, displayGP.c_str(), CENTER);
           return;
         }
       }
@@ -713,9 +729,8 @@ void DrawDemoMode(int mode) {
         DrawNextRace(false);
         gfx.setFont(u8g2_font_helvB08_tf);
         drawStringRED(SCREEN_WIDTH - 5, DRIVERS_TITLE_Y, F("Starting Grid"), RIGHT);
-        if (nextRound > 0) {
-          DrawStartingGrid(nextRound);
-        } else if (lastRound > 0) {
+        // Always use lastRound (previous race) for starting grid in demo
+        if (lastRound > 0) {
           DrawStartingGrid(lastRound);
         }
         DrawConstructors();
@@ -727,9 +742,8 @@ void DrawDemoMode(int mode) {
         DrawNextRace(true);  // Force "Race in Progress!" mode
         gfx.setFont(u8g2_font_helvB08_tf);
         drawStringRED(SCREEN_WIDTH - 5, DRIVERS_TITLE_Y, F("Starting Grid"), RIGHT);
-        if (nextRound > 0) {
-          DrawStartingGrid(nextRound);
-        } else if (lastRound > 0) {
+        // Always use lastRound (previous race) for starting grid in demo
+        if (lastRound > 0) {
           DrawStartingGrid(lastRound);
         }
         DrawConstructors();

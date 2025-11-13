@@ -1,6 +1,11 @@
-# F1 Tracker - E-Paper Display
+# F1 Tracker - 3 Color E-Paper Display with Enhanced Features
 
-A Formula 1 race information display using an ESP32-C3 Mini and 3-color e-paper display. Shows race calendar, driver standings, constructor standings, starting grids, and race results with intelligent update scheduling based on race timing.
+This is an enhanced version of https://github.com/mazur888/F1-Info-display. Including new features, caching and adjustable updates. Designed specifically for a ESP32-C3 Supermini and a 3-color e-paper display. Shows race calendar, driver standings, constructor standings, starting grids, and race results with intelligent update scheduling based on race timing.
+
+<p align="center">
+<a href="https://www.buymeacoffee.com/wnt2fly" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="35" width="auto"></a>
+</p>
+  
 
 ![F1 Tracker](https://img.shields.io/badge/F1-Tracker-red) ![ESP32](https://img.shields.io/badge/ESP32-C3-blue) ![E-Paper](https://img.shields.io/badge/Display-3Color-green)
 

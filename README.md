@@ -137,6 +137,8 @@ The display will show setup instructions during this process.
 - Shows starting grid
 - Shows empty podium (no names)
 
+![Race in Progress Screen](photos/inprogress.png)
+
 ## Update Schedule
 
 The display automatically adjusts update frequency based on race timing:

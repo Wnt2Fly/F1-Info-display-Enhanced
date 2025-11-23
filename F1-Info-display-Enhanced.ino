@@ -19,6 +19,37 @@ bool wifiConnected = false;
 // Scheduler Variables - NOW USING WALL CLOCK ALIGNMENT
 unsigned long lastCheckMinute = 0;  // Track which minute we last checked
 
+// ------------------- DEBUG MODE ----------------------
+// Set to 1 to enable debug mode with time offset simulation
+// In debug mode, all time calculations use simulated time, but API calls use real time
+// This allows testing race scenarios using past races that have complete data
+//
+// INTERACTIVE COMMANDS (when DEBUG_MODE = 1):
+// Open Serial Monitor (115200 baud) and send commands:
+//   +1h, +2h, +6h    - Add hours to offset
+//   -1h, -2h, -6h    - Subtract hours from offset
+//   +1d, +2d, +7d    - Add days to offset
+//   -1d, -2d, -7d    - Subtract days from offset
+//   set <seconds>    - Set exact offset (e.g., "set -2592000")
+//   reset            - Reset to default offset
+//   status           - Show current offset and simulated time
+//   refresh          - Force immediate display update
+//   before           - Jump to 2 hours before race (if race detected)
+//   during           - Jump to race start time
+//   after            - Jump to 1 hour after race start
+//
+// IMPORTANT: Set to 1 to enable debug mode, 0 to disable
+#define DEBUG_MODE 0
+
+// Time offset in seconds (negative = simulate being in the past relative to real time)
+// This is now a variable (not const) so it can be changed interactively in debug mode
+// Default: -30 days
+long debugTimeOffsetSeconds = -2592000;
+
+// Auto-refresh flag for debug mode (set to false to disable automatic scheduler updates)
+// Default to false in debug mode - only refresh when menu option is selected
+bool debugAutoRefresh = false;
+
 // ------------------- TIME CONSTANTS ----------------------
 // Race timing windows (in seconds)
 const long RACE_IN_PROGRESS_WINDOW_SEC = 14400;      // 4 hours - race considered "in progress"
@@ -207,6 +238,27 @@ String nextTime, lastTime;
 
 struct tm timeinfo;
 
+// ------------------- DEBUG TIME HELPERS ----------------------
+// Get simulated time for logic/scheduling (uses offset in debug mode)
+time_t getSimulatedTime() {
+  #if DEBUG_MODE
+    return time(nullptr) + debugTimeOffsetSeconds;
+  #else
+    return time(nullptr);
+  #endif
+}
+
+// Get simulated local time and populate timeinfo struct
+// In debug mode, this uses simulated time; otherwise uses real time
+bool getSimulatedLocalTime(struct tm* timeinfo) {
+  #if DEBUG_MODE
+    time_t simTime = getSimulatedTime();
+    return localtime_r(&simTime, timeinfo) != nullptr;
+  #else
+    return getLocalTime(timeinfo);
+  #endif
+}
+
 // ------------------- PERSISTED STATE ----------------------
 Preferences prefs;
 unsigned processedRound = 0;
@@ -229,8 +281,9 @@ String buildApiUrl(const char* suffix) {
 }
 
 // Build the season base URL, independent of global timeinfo
+// NOTE: Always uses REAL time (not simulated) so API calls fetch correct year's data
 String seasonBaseUrl() {
-  time_t now = time(nullptr);
+  time_t now = time(nullptr);  // Real time for API calls
   struct tm ti = {};
   localtime_r(&now, &ti);
   int currentYear = ti.tm_year + 1900;
@@ -388,7 +441,7 @@ time_t isoUtcToEpoch(const String& ymd, const String& hms) {
 bool isRaceInProgress() {
   if (nextRaceEpoch == 0) return false;
   
-  time_t now = time(nullptr);
+  time_t now = getSimulatedTime();  // Use simulated time for logic
   long diffToRaceStart = nextRaceEpoch - now;
   
   // Race is "in progress" from start time until +4 hours
@@ -404,7 +457,7 @@ bool isInRaceWindow() {
   // Race window = 6 hours before race start to 6 hours after
   if (nextRaceEpoch == 0) return false;
   
-  time_t now = time(nullptr);
+  time_t now = getSimulatedTime();  // Use simulated time for logic
   long diff = nextRaceEpoch - now;
   
   return (diff <= RACE_WINDOW_BEFORE_SEC && diff >= -RACE_WINDOW_AFTER_SEC);
@@ -636,6 +689,77 @@ void configModeCallback(WiFiManager* myWiFiManager) {
   Serial.println("Password: formula1");
 }
 
+// ------------------- MODE DETECTION -------------------
+#if DEBUG_MODE
+int getCurrentDisplayMode() {
+  time_t nowEpoch = getSimulatedTime();
+  
+  // First, check if we have a next race scheduled
+  if (nextRaceEpoch > 0 && nextRound > 0) {
+    long diffToRace = (long)(nextRaceEpoch - nowEpoch);
+    
+    // Mode 3: Race In Progress (race started, results not available)
+    // Race is in progress if we're past start time but within 4 hours
+    if (diffToRace <= 0 && diffToRace >= -RACE_IN_PROGRESS_WINDOW_SEC) {
+      // Check if results are available for THIS race (nextRound)
+      bool haveResultsForCurrentRace = false;
+      
+      // Check cache for nextRound results
+      if (getCachedData(&apiCache.results, CACHE_TTL_STANDINGS)) {
+        StaticJsonDocument<512> filter;
+        filter["MRData"]["RaceTable"]["Races"][0]["round"] = true;
+        filter["MRData"]["RaceTable"]["Races"][0]["Results"][0] = true;
+        DeserializationError err = deserializeJson(doc, apiCache.results.data, DeserializationOption::Filter(filter));
+        if (!err && doc["MRData"]["RaceTable"]["Races"].size() > 0) {
+          // Check if this is the current race
+          unsigned int cachedRound = doc["MRData"]["RaceTable"]["Races"][0]["round"] | 0;
+          if (cachedRound == nextRound) {
+            if (doc["MRData"]["RaceTable"]["Races"][0]["Results"].is<JsonArray>()) {
+              JsonArray results = doc["MRData"]["RaceTable"]["Races"][0]["Results"].as<JsonArray>();
+              haveResultsForCurrentRace = (results.size() >= 3);
+            }
+          }
+        }
+      }
+      
+      // If no results for current race, it's Mode 3
+      if (!haveResultsForCurrentRace) {
+        return 3;  // Race In Progress
+      }
+      // If results are available, fall through to Mode 4 check
+    }
+    
+    // Mode 2: Race Approaching (within 18h before race, grid available)
+    // Check this BEFORE Mode 4, since Mode 2 is more specific
+    if (diffToRace > 0 && diffToRace <= NEXT_RACE_APPROACHING_SEC) {
+      if (qualifyingAvailableForRound(nextRound)) {
+        return 2;  // Race Approaching
+      }
+    }
+  }
+  
+  // Mode 4: Post-Race (results available for last completed race)
+  // Only check if we're NOT in race window for next race AND far enough past last race
+  // This prevents Mode 4 from showing when we're just in normal operation with old results
+  if (lastRound > 0 && !isRaceInProgress() && !isInRaceWindow()) {
+    // Check if we're more than 4 hours past the last race start
+    time_t lastRaceStartEpoch = isoUtcToEpoch(lastDate, lastTime);
+    if (lastRaceStartEpoch > 0) {
+      long diffSinceLastRace = nowEpoch - lastRaceStartEpoch;
+      // Only show Mode 4 if we're well past the last race (more than 4 hours)
+      if (diffSinceLastRace > RACE_IN_PROGRESS_WINDOW_SEC) {
+        if (resultsAvailableForLastRound()) {
+          return 4;  // Post-Race
+        }
+      }
+    }
+  }
+  
+  // Mode 1: Normal Operation (default)
+  return 1;  // Normal Operation
+}
+#endif
+
 // ------------------- HEADER -------------------
 void DrawTime() {
   char datebuf[16], timebuf[16];
@@ -645,6 +769,10 @@ void DrawTime() {
   for (char* p = timebuf; *p; ++p) *p = tolower(*p);
 
   String leftStr  = String("Today: ")   + datebuf;
+  #if DEBUG_MODE
+    int currentMode = getCurrentDisplayMode();
+    leftStr = String("[DEBUG] Mode ") + String(currentMode) + " " + datebuf;  // Show debug indicator with mode
+  #endif
   String rightStr = String("Updated: ") + timebuf;
 
   gfx.setFont(u8g2_font_helvB08_tf);
@@ -691,7 +819,7 @@ void FetchCalendar() {
   }
 
   JsonArray races = doc["MRData"]["RaceTable"]["Races"].as<JsonArray>();
-  time_t nowEpoch = time(nullptr);
+  time_t nowEpoch = getSimulatedTime();  // Use simulated time for logic
   int race_count = 0;
 
   for (JsonObject race : races) {
@@ -762,7 +890,7 @@ void FetchCalendar() {
 // ------------------- DRAW LAST RACE -------------------
 void DrawLastRace(bool currentRaceInProgress) {
   unsigned int targetRound = lastRound;
-  time_t nowEpoch = time(nullptr);
+  time_t nowEpoch = getSimulatedTime();  // Use simulated time for logic
   
   // Calculate timing values
   long diffToNext = nextRaceEpoch ? (long)(nextRaceEpoch - nowEpoch) : 999999;
@@ -781,18 +909,50 @@ void DrawLastRace(bool currentRaceInProgress) {
   
   // Check if results are available
   bool haveResults = resultsAvailableForLastRound();
+  
+  #if DEBUG_MODE
+    // In debug mode, use mode detection to determine behavior
+    int currentMode = getCurrentDisplayMode();
+    Serial.printf("[DEBUG] DrawLastRace: currentMode = %d, nextRaceApproaching = %d, currentRaceInProgress = %d\n", 
+                  currentMode, nextRaceApproaching, currentRaceInProgress);
+    // Mode 2 (Race Approaching): Always show blank podium, hide old results
+    if (currentMode == 2) {
+      Serial.println(F("[DEBUG] DrawLastRace: Mode 2 detected, showing blank podium"));
+      display.drawBitmap(SCREEN_WIDTH / 2 - logoWidth / 2, PODIUM_LOGO_Y, F1_Logo, logoWidth, logoHeight, GxEPD_RED);
+      display.drawRect(PODIUM_1ST_X, PODIUM_1ST_Y, PODIUM_1ST_W, PODIUM_1ST_H, GxEPD_BLACK);
+      display.drawRect(PODIUM_2ND_X, PODIUM_2ND_Y, PODIUM_2ND_W, PODIUM_2ND_H, GxEPD_BLACK);
+      display.drawRect(PODIUM_3RD_X, PODIUM_3RD_Y, PODIUM_3RD_W, PODIUM_3RD_H, GxEPD_BLACK);
+      drawStringBLACK(PODIUM_TEXT_CENTER_X, PODIUM_TEXT_Y, "Awaiting Results", CENTER);
+      return;
+    }
+  #else
+    int currentMode = 0;  // Not used in production, but needed for variable scope
+  #endif
 
-  // If next race is within 18h, show blank podium instead of old results
+  // If next race is within 18h (Mode 2: Race Approaching), show blank podium
+  // This hides old results and shows "Awaiting Results" for the upcoming race
+  // Also check if qualifying is available (confirms we're in Mode 2, not just approaching)
   if (nextRaceApproaching && !currentRaceInProgress) {
-    display.drawBitmap(SCREEN_WIDTH / 2 - logoWidth / 2, PODIUM_LOGO_Y, F1_Logo, logoWidth, logoHeight, GxEPD_RED);
-    display.drawRect(PODIUM_1ST_X, PODIUM_1ST_Y, PODIUM_1ST_W, PODIUM_1ST_H, GxEPD_BLACK);
-    display.drawRect(PODIUM_2ND_X, PODIUM_2ND_Y, PODIUM_2ND_W, PODIUM_2ND_H, GxEPD_BLACK);
-    display.drawRect(PODIUM_3RD_X, PODIUM_3RD_Y, PODIUM_3RD_W, PODIUM_3RD_H, GxEPD_BLACK);
-    // Position text centered under podium boxes
-    drawStringBLACK(PODIUM_TEXT_CENTER_X, PODIUM_TEXT_Y, "Awaiting Results", CENTER);
-    return;
+    // Double-check: if qualifying is available, we're definitely in Mode 2
+    if (nextRound > 0 && qualifyingAvailableForRound(nextRound)) {
+      display.drawBitmap(SCREEN_WIDTH / 2 - logoWidth / 2, PODIUM_LOGO_Y, F1_Logo, logoWidth, logoHeight, GxEPD_RED);
+      display.drawRect(PODIUM_1ST_X, PODIUM_1ST_Y, PODIUM_1ST_W, PODIUM_1ST_H, GxEPD_BLACK);
+      display.drawRect(PODIUM_2ND_X, PODIUM_2ND_Y, PODIUM_2ND_W, PODIUM_2ND_H, GxEPD_BLACK);
+      display.drawRect(PODIUM_3RD_X, PODIUM_3RD_Y, PODIUM_3RD_W, PODIUM_3RD_H, GxEPD_BLACK);
+      drawStringBLACK(PODIUM_TEXT_CENTER_X, PODIUM_TEXT_Y, "Awaiting Results", CENTER);
+      return;
+    }
   }
 
+  // If we're in Mode 2 (next race approaching with grid), don't show old race name
+  // Skip drawing old podium entirely (already handled above, but double-check)
+  #if DEBUG_MODE
+    if (currentMode == 2) {
+      // Already handled above, but double-check we don't continue
+      return;
+    }
+  #endif
+  
   // Determine which GP name to show
   // If race is in progress but API has already updated (moved to "last"), use lastGP
   // If race is in progress and still "next" in API, use nextGP
@@ -891,7 +1051,7 @@ String nextRaceCountdownDH() {
   time_t epoch = nextRaceEpoch ? nextRaceEpoch : isoUtcToEpoch(nextDate, nextTime);
   if (!epoch) return "";
 
-  long diff = (long)(epoch - time(nullptr));
+  long diff = (long)(epoch - getSimulatedTime());  // Use simulated time for logic
   if (diff <= 0) {
     return "";
   }
@@ -940,6 +1100,15 @@ void DrawNextRace() {
     return;
   }
 
+  // Check if we're showing the starting grid (within 18h of race) - show "Awaiting Results" instead of countdown
+  bool showingGrid = false;
+  if (nextRaceEpoch > 0 && nextRound > 0) {
+    long diff = (long)(nextRaceEpoch - getSimulatedTime());  // Use simulated time for logic
+    if (diff > 0 && diff <= NEXT_RACE_APPROACHING_SEC && qualifyingAvailableForRound(nextRound)) {
+      showingGrid = true;
+    }
+  }
+
   // Line 1: "Next:" + race name
   const char* nextLabel = "Next:";
   int nextLabelW = textWidth(nextLabel);
@@ -948,77 +1117,166 @@ void DrawNextRace() {
   display.fillRect(nextLabelW + 4, NEXT_LINE1_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - nextLabelW - 4, LINE_H, GxEPD_WHITE);
   drawStringBLACK(nextLabelW + 4, NEXT_LINE1_Y, nextGP, LEFT);
 
-  // Line 2: "Lights Out:" + dynamic tail
-  const char* loLabel = "Lights Out:";
-  int loW = textWidth(loLabel);
-  drawStringRED(0, NEXT_LINE2_Y, loLabel, LEFT);
+  // Line 2: Show "Awaiting Results" if grid is showing, otherwise show countdown
+  if (showingGrid) {
+    // Grid is showing, so race is approaching - show "Awaiting Results"
+    const char* awaitLabel = "Awaiting Results";
+    drawStringRED(0, NEXT_LINE2_Y, awaitLabel, LEFT);
+    display.fillRect(textWidth(awaitLabel) + 4, NEXT_LINE2_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - textWidth(awaitLabel) - 4, LINE_H, GxEPD_WHITE);
+  } else {
+    // Normal countdown display
+    const char* loLabel = "Lights Out:";
+    int loW = textWidth(loLabel);
+    drawStringRED(0, NEXT_LINE2_Y, loLabel, LEFT);
 
-  time_t epoch = nextRaceEpoch ? nextRaceEpoch : isoUtcToEpoch(nextDate, nextTime);
-  long diff = epoch ? (long)(epoch - time(nullptr)) : 0;
+    time_t epoch = nextRaceEpoch ? nextRaceEpoch : isoUtcToEpoch(nextDate, nextTime);
+    long diff = epoch ? (long)(epoch - getSimulatedTime()) : 0;  // Use simulated time for logic
 
-  if (diff <= 0) {
-    // This shouldn't happen now that we have isRaceInProgress() check above
-    // But keep as fallback
-    display.fillRect(0, NEXT_LINE2_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH, LINE_H, GxEPD_WHITE);
-    drawStringRED(0, NEXT_LINE2_Y, "Lights Out!", LEFT);
-    return;
+    if (diff <= 0) {
+      // This shouldn't happen now that we have isRaceInProgress() check above
+      // But keep as fallback
+      display.fillRect(0, NEXT_LINE2_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH, LINE_H, GxEPD_WHITE);
+      drawStringRED(0, NEXT_LINE2_Y, "Lights Out!", LEFT);
+      return;
+    }
+    
+    String dLocal = nextRaceLocalDateMMDD();
+    String tLocal = nextRaceLocalTimeLower();
+    String tMinus = nextRaceCountdownDH();
+
+    String tail;
+    tail.reserve(64);  // Pre-allocate to reduce fragmentation
+    if (dLocal.length()) tail += dLocal;
+    if (tLocal.length()) { 
+      tLocal.trim();
+      if (tail.length()) tail += " "; 
+      tail += tLocal; 
+    }
+    if (tMinus.length()) { if (tail.length()) tail += " - "; tail += tMinus; }
+    tail.trim();
+
+    // Clear only the area where countdown will be written (left side)
+    display.fillRect(loW + 4, NEXT_LINE2_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - loW - 4, LINE_H, GxEPD_WHITE);
+    drawStringBLACK(loW + 4, NEXT_LINE2_Y, tail, LEFT);
   }
-  
-  String dLocal = nextRaceLocalDateMMDD();
-  String tLocal = nextRaceLocalTimeLower();
-  String tMinus = nextRaceCountdownDH();
-
-  String tail;
-  tail.reserve(64);  // Pre-allocate to reduce fragmentation
-  if (dLocal.length()) tail += dLocal;
-  if (tLocal.length()) { 
-    tLocal.trim();
-    if (tail.length()) tail += " "; 
-    tail += tLocal; 
-  }
-  if (tMinus.length()) { if (tail.length()) tail += " - "; tail += tMinus; }
-  tail.trim();
-
-  // Clear only the area where countdown will be written (left side)
-  display.fillRect(loW + 4, NEXT_LINE2_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - loW - 4, LINE_H, GxEPD_WHITE);
-  drawStringBLACK(loW + 4, NEXT_LINE2_Y, tail, LEFT);
 }
 
 void DrawDrivers() {
   bool showGrid = false;
+  unsigned int gridRound = 0;
   
-  // Check if we should show Starting Grid for the NEXT race (within 18h)
-  if (nextRaceEpoch > 0 && nextRound > 0) {
-    long diff = (long)(nextRaceEpoch - time(nullptr));
-   if (diff > 0 && diff <= NEXT_RACE_APPROACHING_SEC && qualifyingAvailableForRound(nextRound)) {
-      showGrid = true;
-    }
-  }
-  
-  // OR check if race is currently in progress for LAST race (within 4 hours of start)
-  if (!showGrid && lastRound > 0) {
-    time_t nowEpoch = time(nullptr);
-    time_t lastRaceStartEpoch = isoUtcToEpoch(lastDate, lastTime);
-    bool isStillRaceEvent = (nowEpoch >= lastRaceStartEpoch) && 
-                            (nowEpoch <= lastRaceStartEpoch + RACE_IN_PROGRESS_WINDOW_SEC);
+  #if DEBUG_MODE
+    // Use mode detection to determine what to show
+    int currentMode = getCurrentDisplayMode();
+    Serial.printf("[DEBUG] DrawDrivers: Current mode = %d\n", currentMode);
     
-    if (isStillRaceEvent && qualifyingAvailableForRound(lastRound)) {
+    if (currentMode == 2 || currentMode == 3) {
+      // Mode 2: Race Approaching - show grid for nextRound
+      // Mode 3: Race In Progress - show grid until results available
       showGrid = true;
-      // Draw the grid for the race that's happening NOW (lastRound)
-      gfx.setFont(u8g2_font_helvB08_tf);
-      drawStringRED(SCREEN_WIDTH - 5, DRIVERS_TITLE_Y, F("Starting Grid"), RIGHT);
-      DrawStartingGrid(lastRound);
-      return;
+      // For Mode 3, try nextRound first (race just started, still in nextRound)
+      if (currentMode == 3) {
+        if (nextRound > 0 && qualifyingAvailableForRound(nextRound)) {
+          gridRound = nextRound;
+          Serial.printf("[DEBUG] DrawDrivers: Mode 3 - using nextRound %u for grid\n", nextRound);
+        } else if (lastRound > 0 && qualifyingAvailableForRound(lastRound)) {
+          gridRound = lastRound;
+          Serial.printf("[DEBUG] DrawDrivers: Mode 3 - using lastRound %u for grid\n", lastRound);
+        } else {
+          Serial.println(F("[DEBUG] DrawDrivers: Mode 3 - qualifying not available, trying to find correct round"));
+          // Even if qualifying not available, try to show grid for the race in progress
+          // At race start, the race might still be in nextRound, or might have moved to lastRound
+          // Check which one is the current race based on timing
+          time_t nowEpoch = getSimulatedTime();
+          if (nextRaceEpoch > 0) {
+            long diffToNext = (long)(nextRaceEpoch - nowEpoch);
+            // If we're at or past race start, the race might be in lastRound now
+            if (diffToNext <= 0 && lastRound > 0) {
+              gridRound = lastRound;
+              Serial.printf("[DEBUG] DrawDrivers: Mode 3 - using lastRound %u (race has started)\n", lastRound);
+            } else if (nextRound > 0) {
+              gridRound = nextRound;
+              Serial.printf("[DEBUG] DrawDrivers: Mode 3 - using nextRound %u\n", nextRound);
+            }
+          } else if (lastRound > 0) {
+            gridRound = lastRound;
+            Serial.printf("[DEBUG] DrawDrivers: Mode 3 - using lastRound %u (no next race)\n", lastRound);
+          }
+        }
+      } else {
+        // Mode 2: Race Approaching
+        if (nextRound > 0 && qualifyingAvailableForRound(nextRound)) {
+          gridRound = nextRound;
+        } else if (lastRound > 0 && qualifyingAvailableForRound(lastRound)) {
+          gridRound = lastRound;
+        }
+      }
+    } else {
+      // Mode 1 or Mode 4: Show driver standings
+      showGrid = false;
+      Serial.printf("[DEBUG] DrawDrivers: Mode %d - showing driver standings\n", currentMode);
     }
-  }
+  #else
+    // Production mode logic
+    // Check if we should show Starting Grid for the NEXT race (within 18h BEFORE race start)
+    if (nextRaceEpoch > 0 && nextRound > 0) {
+      long diff = (long)(nextRaceEpoch - getSimulatedTime());
+      if (diff > 0 && diff <= NEXT_RACE_APPROACHING_SEC && qualifyingAvailableForRound(nextRound)) {
+        showGrid = true;
+        gridRound = nextRound;
+      }
+    }
+    
+    // Check if race is currently in progress (race has started but results not available yet)
+    if (!showGrid && isRaceInProgress()) {
+      // Check if results are available for CURRENT race (nextRound)
+      bool haveResultsForCurrentRace = false;
+      if (nextRound > 0) {
+        // Check cache for nextRound results specifically
+        if (getCachedData(&apiCache.results, CACHE_TTL_STANDINGS)) {
+          StaticJsonDocument<512> filter;
+          filter["MRData"]["RaceTable"]["Races"][0]["round"] = true;
+          filter["MRData"]["RaceTable"]["Races"][0]["Results"][0] = true;
+          DeserializationError err = deserializeJson(doc, apiCache.results.data, DeserializationOption::Filter(filter));
+          if (!err && doc["MRData"]["RaceTable"]["Races"].size() > 0) {
+            unsigned int cachedRound = doc["MRData"]["RaceTable"]["Races"][0]["round"] | 0;
+            if (cachedRound == nextRound && doc["MRData"]["RaceTable"]["Races"][0]["Results"].is<JsonArray>()) {
+              JsonArray results = doc["MRData"]["RaceTable"]["Races"][0]["Results"].as<JsonArray>();
+              haveResultsForCurrentRace = (results.size() >= 3);
+            }
+          }
+        }
+      }
+      
+      // If no results for current race, show grid
+      if (!haveResultsForCurrentRace) {
+        if (nextRound > 0 && qualifyingAvailableForRound(nextRound)) {
+          showGrid = true;
+          gridRound = nextRound;
+        } else if (lastRound > 0 && qualifyingAvailableForRound(lastRound)) {
+          showGrid = true;
+          gridRound = lastRound;
+        }
+      }
+    }
+  #endif
 
   gfx.setFont(u8g2_font_helvB08_tf);
-  if (showGrid) {
+  #if DEBUG_MODE
+    Serial.printf("[DEBUG] DrawDrivers: Final decision - showGrid=%d, gridRound=%u\n", showGrid, gridRound);
+  #endif
+  if (showGrid && gridRound > 0) {
     drawStringRED(SCREEN_WIDTH - 5, DRIVERS_TITLE_Y, F("Starting Grid"), RIGHT);
-    DrawStartingGrid(nextRound);
+    DrawStartingGrid(gridRound);
+    #if DEBUG_MODE
+      Serial.printf("[DEBUG] DrawDrivers: Showing grid for round %u\n", gridRound);
+    #endif
   } else {
     drawStringRED(308, DRIVERS_TITLE_Y, F("Top 10 Drivers"), RIGHT);
     DrawDriversStandings();
+    #if DEBUG_MODE
+      Serial.printf("[DEBUG] DrawDrivers: Showing driver standings (showGrid=%d, gridRound=%u)\n", showGrid, gridRound);
+    #endif
   }
 }
 
@@ -1277,10 +1535,47 @@ bool resultsAvailableForLastRound() {
 
 // ------------------- SETUP -------------------
 void setup() {
+  // Start Serial immediately
   Serial.begin(115200);
+  
+  // ESP32-C3 USB Serial needs time to initialize
+  // Give it time to establish connection
   delay(2000);
+  
+  // Force output - don't wait for Serial.available() check
+  // ESP32-C3 Serial is always "available" even if nothing is connected
+  Serial.println();
+  Serial.println();
+  Serial.println(F("=== F1 TRACKER STARTING ==="));
+  Serial.flush();
+  delay(100);
+  
+  Serial.print(F("Free heap: "));
+  Serial.println(ESP.getFreeHeap());
+  Serial.flush();
+  
+  Serial.print(F("Chip model: "));
+  Serial.println(ESP.getChipModel());
+  Serial.flush();
+  
+  Serial.print(F("Chip revision: "));
+  Serial.println(ESP.getChipRevision());
+  Serial.flush();
+  
+  #if DEBUG_MODE
+    Serial.println(F("*** DEBUG MODE IS ENABLED ***"));
+    Serial.println();
+    printDebugMenu();
+  #else
+    Serial.println(F("Normal mode (DEBUG_MODE = 0)"));
+    Serial.println(F("To enable debug mode, set DEBUG_MODE to 1 in code"));
+  #endif
+  Serial.flush();
 
   // Initialize SPI and display
+  Serial.println(F("[INIT] Starting SPI..."));
+  Serial.flush();
+  
   SPI.begin(EPDSCK, -1, EPDMOSI, EPDCS);
   SPI.setFrequency(4000000);
   pinMode(EPDBUSY, INPUT);
@@ -1288,7 +1583,13 @@ void setup() {
   pinMode(EPDDC,  OUTPUT);
   pinMode(EPDCS,  OUTPUT);
 
+  Serial.println(F("[INIT] Initializing display..."));
+  Serial.flush();
+  
   display.init();
+  Serial.println(F("[INIT] Display initialized"));
+  Serial.flush();
+  
   display.setRotation(3);
   gfx.begin(display);
   gfx.setFontMode(0);
@@ -1297,6 +1598,9 @@ void setup() {
   gfx.setFont(u8g2_font_helvB10_tf);
   display.fillScreen(GxEPD_WHITE);
   display.setFullWindow();
+  
+  Serial.println(F("[INIT] Display setup complete"));
+  Serial.flush();
 
   // Setup WiFi using WiFiManager
   WiFiManager wifiManager;
@@ -1323,13 +1627,33 @@ void setup() {
   Serial.println(F("\n[WiFi] Connected!"));
   Serial.println("IP: " + WiFi.localIP().toString());
 
-  // Configure time
+  // Configure time (always sync real time first for NTP)
   configTzTime(MY_TZ, NTP1, NTP2);
-  while (!getLocalTime(&timeinfo)) { 
+  struct tm realTime;
+  while (!getLocalTime(&realTime)) { 
     delay(1000); 
     Serial.print("."); 
   }
   Serial.println(F("\n[Time] Synced!"));
+  
+  // Now get simulated time for logic (in debug mode, this applies offset)
+  getSimulatedLocalTime(&timeinfo);
+  #if DEBUG_MODE
+    Serial.println(F("\n=== DEBUG MODE ENABLED ==="));
+    Serial.println(F("Interactive commands available via Serial Monitor:"));
+    Serial.println(F("  +1h, +2h, +6h  - Add hours"));
+    Serial.println(F("  -1h, -2h, -6h  - Subtract hours"));
+    Serial.println(F("  +1d, +2d, +7d  - Add days"));
+    Serial.println(F("  -1d, -2d, -7d  - Subtract days"));
+    Serial.println(F("  set <sec>      - Set exact offset"));
+    Serial.println(F("  reset          - Reset to default"));
+    Serial.println(F("Type a number (1-7) or full command"));
+    Serial.println(F("Type 'menu' or 'help' to see menu again"));
+    Serial.printf("[DEBUG] Current offset: %ld seconds\n", debugTimeOffsetSeconds);
+    Serial.printf("[DEBUG] Simulated time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  #endif
 
   // Show success message
   display.fillScreen(GxEPD_WHITE);
@@ -1376,8 +1700,8 @@ void setup() {
 
 // ------------------- FULL REFRESH -------------------
 void fullRefreshAndReschedule() {
-  // Update current time before drawing
-  getLocalTime(&timeinfo);
+  // Update current time before drawing (uses simulated time in debug mode)
+  getSimulatedLocalTime(&timeinfo);
   
   display.setFullWindow();
   display.firstPage();
@@ -1403,19 +1727,50 @@ bool shouldUpdateNow(int currentMinute) {
     return false;
   }
   
+  time_t now = getSimulatedTime();  // Use simulated time for logic
+  
+  // Check if last race just finished (within 4 hours) - need to check for results
+  // This check must happen even if nextRaceEpoch is 0 (race moved from "next" to "last" in API)
+  bool lastRaceJustFinished = false;
+  if (lastRound > 0) {
+    time_t lastRaceStartEpoch = isoUtcToEpoch(lastDate, lastTime);
+    if (lastRaceStartEpoch > 0) {
+      long diffSinceLastRace = now - lastRaceStartEpoch;
+      lastRaceJustFinished = (diffSinceLastRace >= 0 && diffSinceLastRace <= RACE_IN_PROGRESS_WINDOW_SEC);
+    }
+  }
+  
+  // Priority 1: Last race just finished - update every 30 minutes to catch results
+  if (lastRaceJustFinished) {
+    if (currentMinute % UPDATE_INTERVAL_RACE_WINDOW_MIN == 0) {
+      Serial.printf("[Scheduler] Last race just finished - update triggered at minute %d\n", currentMinute);
+      return true;
+    }
+  }
+  
   if (nextRaceEpoch == 0) {
-    // No race scheduled, use normal 2-hour updates
+    // No next race scheduled, use normal 2-hour updates
     if (currentMinute == 0 && (timeinfo.tm_hour % 2 == 0)) {
       return true;
     }
     return false;
   }
   
-  time_t now = time(nullptr);
   long diffToRace = (long)(nextRaceEpoch - now);
+  
+  // Check if race is in progress (within 4 hours of start) - need frequent updates to catch results
+  bool raceInProgress = isRaceInProgress();
   
   // Determine if we're in race window (6h before to 6h after race)
   bool inRaceWindow = isInRaceWindow();
+  
+  // Priority 2: Race in progress - update every 30 minutes to catch results
+  if (raceInProgress) {
+    if (currentMinute % UPDATE_INTERVAL_RACE_WINDOW_MIN == 0) {
+      Serial.printf("[Scheduler] Race in progress - update triggered at minute %d\n", currentMinute);
+      return true;
+    }
+  }
   
   if (inRaceWindow) {
     // During race window: Update every 30 minutes (at :00 and :30)
@@ -1496,6 +1851,12 @@ void ensureWiFiConnected() {
 }
 
 void disconnectWiFiIfIdle() {
+  // In debug mode, keep WiFi connected for faster testing
+  #if DEBUG_MODE
+    // Keep WiFi connected in debug mode for interactive commands
+    return;
+  #endif
+  
   // Disconnect WiFi after updates to save power
   // WiFi will be reconnected automatically when needed
   if (WiFi.status() == WL_CONNECTED) {
@@ -1506,13 +1867,284 @@ void disconnectWiFiIfIdle() {
   }
 }
 
+// ------------------- DEBUG COMMAND HANDLER -------------------
+#if DEBUG_MODE
+void printDebugMenu() {
+  Serial.println(F("\n=== DEBUG MODE MENU ==="));
+  Serial.println(F("1 - Normal (3 days before race)"));
+  Serial.println(F("2 - Before (2h before race)"));
+  Serial.println(F("3 - During (race start)"));
+  Serial.println(F("4 - After (1h after start)"));
+  Serial.println(F("5 - Refresh display"));
+  Serial.println(F("6 - Show status"));
+  Serial.println(F("7 - Reset offset"));
+  Serial.println(F("8 - Toggle auto-refresh"));
+  Serial.printf("   (Auto-refresh: %s)\n", debugAutoRefresh ? "ON" : "OFF");
+  Serial.println(F("\nTime Adjustments:"));
+  Serial.println(F("+1h, +2h, +6h  - Add hours"));
+  Serial.println(F("-1h, -2h, -6h  - Subtract hours"));
+  Serial.println(F("+1d, +2d, +7d  - Add days"));
+  Serial.println(F("-1d, -2d, -7d  - Subtract days"));
+  Serial.println(F("set <sec>      - Set exact offset"));
+  Serial.println(F("\nType number or command, then press Enter"));
+  Serial.println();
+}
+
+void handleDebugCommands() {
+  if (!Serial.available()) return;
+  
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  cmd.toLowerCase();
+  
+  if (cmd.length() == 0) return;
+  
+  // Handle numeric menu selections
+  if (cmd.length() == 1 && cmd[0] >= '1' && cmd[0] <= '8') {
+    int menuChoice = cmd[0] - '0';
+    switch(menuChoice) {
+      case 1:
+        cmd = "normal";
+        break;
+      case 2:
+        cmd = "before";
+        break;
+      case 3:
+        cmd = "during";
+        break;
+      case 4:
+        cmd = "after";
+        break;
+      case 5:
+        cmd = "refresh";
+        break;
+      case 6:
+        cmd = "status";
+        break;
+      case 7:
+        cmd = "reset";
+        break;
+      case 8:
+        cmd = "autorefresh";
+        break;
+    }
+  }
+  
+  // Handle "menu" or "help" command
+  if (cmd == "menu" || cmd == "help" || cmd == "?") {
+    printDebugMenu();
+    return;
+  }
+  
+  // Parse hour/day adjustments: +1h, -2h, +1d, -7d
+  if (cmd.endsWith("h")) {
+    int hours = cmd.substring(0, cmd.length() - 1).toInt();
+    debugTimeOffsetSeconds += hours * SECONDS_PER_HOUR;
+    Serial.printf("[DEBUG] Adjusted by %d hours. New offset: %ld seconds\n", hours, debugTimeOffsetSeconds);
+    getSimulatedLocalTime(&timeinfo);
+    Serial.printf("[DEBUG] Simulated time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    return;
+  }
+  
+  if (cmd.endsWith("d")) {
+    int days = cmd.substring(0, cmd.length() - 1).toInt();
+    debugTimeOffsetSeconds += days * SECONDS_PER_DAY;
+    Serial.printf("[DEBUG] Adjusted by %d days. New offset: %ld seconds\n", days, debugTimeOffsetSeconds);
+    getSimulatedLocalTime(&timeinfo);
+    Serial.printf("[DEBUG] Simulated time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    return;
+  }
+  
+  // Parse "set <seconds>"
+  if (cmd.startsWith("set ")) {
+    long newOffset = cmd.substring(4).toInt();
+    debugTimeOffsetSeconds = newOffset;
+    Serial.printf("[DEBUG] Set offset to %ld seconds\n", debugTimeOffsetSeconds);
+    getSimulatedLocalTime(&timeinfo);
+    Serial.printf("[DEBUG] Simulated time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    return;
+  }
+  
+  // Reset to default
+  if (cmd == "reset") {
+    debugTimeOffsetSeconds = -2592000;  // -30 days default
+    Serial.println(F("[DEBUG] Reset to default offset (-30 days)"));
+    getSimulatedLocalTime(&timeinfo);
+    Serial.printf("[DEBUG] Simulated time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    return;
+  }
+  
+  // Show status
+  if (cmd == "status") {
+    time_t realNow = time(nullptr);
+    time_t simNow = getSimulatedTime();
+    getSimulatedLocalTime(&timeinfo);
+    
+    Serial.println(F("\n=== DEBUG STATUS ==="));
+    Serial.printf("Offset: %ld seconds (%.2f days)\n", debugTimeOffsetSeconds, debugTimeOffsetSeconds / 86400.0);
+    Serial.printf("Auto-refresh: %s\n", debugAutoRefresh ? "ON" : "OFF");
+    
+    struct tm realTm = {};
+    localtime_r(&realNow, &realTm);
+    Serial.printf("Real time:    %04d-%02d-%02d %02d:%02d:%02d\n",
+                  realTm.tm_year + 1900, realTm.tm_mon + 1, realTm.tm_mday,
+                  realTm.tm_hour, realTm.tm_min, realTm.tm_sec);
+    Serial.printf("Simulated:    %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    
+    if (nextRaceEpoch > 0) {
+      long diffToRace = (long)(nextRaceEpoch - simNow);
+      Serial.printf("Next race:    Round %u, %s\n", nextRound, nextGP.c_str());
+      Serial.printf("Time to race: %ld seconds (%.2f hours)\n", diffToRace, diffToRace / 3600.0);
+      Serial.printf("Race state:   %s\n", isRaceInProgress() ? "IN PROGRESS" : 
+                    (diffToRace > 0 ? "UPCOMING" : "PAST"));
+    }
+    if (lastRound > 0) {
+      Serial.printf("Last race:    Round %u, %s\n", lastRound, lastGP.c_str());
+    }
+    Serial.println();
+    printDebugMenu();
+    return;
+  }
+  
+  // Force refresh
+  if (cmd == "refresh") {
+    Serial.println(F("[DEBUG] Forcing immediate refresh..."));
+    Serial.println(F("[DEBUG] Connecting WiFi..."));
+    ensureWiFiConnected();
+    Serial.println(F("[DEBUG] Fetching calendar..."));
+    FetchCalendar();
+    Serial.println(F("[DEBUG] Refreshing display (this takes 15-30 seconds)..."));
+    fullRefreshAndReschedule();
+    disconnectWiFiIfIdle();
+    Serial.println(F("[DEBUG] Refresh complete!"));
+    printDebugMenu();
+    return;
+  }
+  
+  // Jump to scenarios (relative to next race)
+  if (cmd == "normal" && nextRaceEpoch > 0) {
+    time_t realNow = time(nullptr);
+    debugTimeOffsetSeconds = (nextRaceEpoch - 259200) - realNow;  // 3 days before race (normal mode)
+    Serial.println(F("[DEBUG] Jumped to 3 days before race (Normal mode)"));
+    getSimulatedLocalTime(&timeinfo);
+    Serial.printf("[DEBUG] Simulated time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    Serial.println(F("[DEBUG] Connecting WiFi..."));
+    ensureWiFiConnected();
+    Serial.println(F("[DEBUG] Fetching calendar..."));
+    FetchCalendar();
+    Serial.println(F("[DEBUG] Refreshing display (this takes 15-30 seconds)..."));
+    fullRefreshAndReschedule();
+    disconnectWiFiIfIdle();
+    Serial.println(F("[DEBUG] Refresh complete!"));
+    printDebugMenu();
+    return;
+  }
+  
+  if (cmd == "before" && nextRaceEpoch > 0) {
+    time_t realNow = time(nullptr);
+    debugTimeOffsetSeconds = (nextRaceEpoch - 7200) - realNow;  // 2 hours before race
+    Serial.println(F("[DEBUG] Jumped to 2 hours before race (Race Approaching)"));
+    getSimulatedLocalTime(&timeinfo);
+    Serial.printf("[DEBUG] Simulated time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    Serial.println(F("[DEBUG] Connecting WiFi..."));
+    ensureWiFiConnected();
+    Serial.println(F("[DEBUG] Fetching calendar..."));
+    FetchCalendar();
+    Serial.println(F("[DEBUG] Refreshing display (this takes 15-30 seconds)..."));
+    fullRefreshAndReschedule();
+    disconnectWiFiIfIdle();
+    Serial.println(F("[DEBUG] Refresh complete!"));
+    printDebugMenu();
+    return;
+  }
+  
+  if (cmd == "during" && nextRaceEpoch > 0) {
+    time_t realNow = time(nullptr);
+    debugTimeOffsetSeconds = nextRaceEpoch - realNow;  // At race start
+    Serial.println(F("[DEBUG] Jumped to race start time (Race In Progress)"));
+    getSimulatedLocalTime(&timeinfo);
+    Serial.printf("[DEBUG] Simulated time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    Serial.println(F("[DEBUG] Connecting WiFi..."));
+    ensureWiFiConnected();
+    Serial.println(F("[DEBUG] Fetching calendar..."));
+    FetchCalendar();
+    Serial.println(F("[DEBUG] Refreshing display (this takes 15-30 seconds)..."));
+    fullRefreshAndReschedule();
+    disconnectWiFiIfIdle();
+    Serial.println(F("[DEBUG] Refresh complete!"));
+    printDebugMenu();
+    return;
+  }
+  
+  if (cmd == "after" && nextRaceEpoch > 0) {
+    time_t realNow = time(nullptr);
+    // Jump to 5 hours after race start to ensure we're past the race window
+    // This ensures Mode 4 is detected (requires >4h past race and not in race window)
+    debugTimeOffsetSeconds = (nextRaceEpoch + 18000) - realNow;  // 5 hours after race start
+    Serial.println(F("[DEBUG] Jumped to 5 hours after race start (Post-Race)"));
+    getSimulatedLocalTime(&timeinfo);
+    Serial.printf("[DEBUG] Simulated time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    Serial.println(F("[DEBUG] Connecting WiFi..."));
+    ensureWiFiConnected();
+    Serial.println(F("[DEBUG] Fetching calendar..."));
+    FetchCalendar();
+    Serial.println(F("[DEBUG] Refreshing display (this takes 15-30 seconds)..."));
+    fullRefreshAndReschedule();
+    disconnectWiFiIfIdle();
+    Serial.println(F("[DEBUG] Refresh complete!"));
+    printDebugMenu();
+    return;
+  }
+  
+  // Toggle auto-refresh
+  if (cmd == "autorefresh" || cmd == "auto") {
+    debugAutoRefresh = !debugAutoRefresh;
+    Serial.printf("[DEBUG] Auto-refresh %s\n", debugAutoRefresh ? "ENABLED" : "DISABLED");
+    if (!debugAutoRefresh) {
+      Serial.println(F("[DEBUG] Scheduler updates disabled. Use 'refresh' or mode commands (1-4) to update manually."));
+    } else {
+      Serial.println(F("[DEBUG] Scheduler updates enabled. Display will auto-refresh on schedule."));
+    }
+    printDebugMenu();
+    return;
+  }
+  
+  if ((cmd == "normal" || cmd == "before" || cmd == "during" || cmd == "after") && nextRaceEpoch == 0) {
+    Serial.println(F("[DEBUG] No race detected. Run 'refresh' first to fetch calendar."));
+    return;
+  }
+  
+  // Unknown command
+  Serial.println(F("[DEBUG] Unknown command."));
+  printDebugMenu();
+}
+#endif
+
 // ------------------- LOOP -------------------
 void loop() {
-  // Get current time (doesn't require WiFi)
-  if (!getLocalTime(&timeinfo)) {
+  // Get current time (doesn't require WiFi) - uses simulated time in debug mode
+  if (!getSimulatedLocalTime(&timeinfo)) {
     // Time sync failed - reconnect WiFi and retry
     ensureWiFiConnected();
-    if (!getLocalTime(&timeinfo)) {
+    if (!getSimulatedLocalTime(&timeinfo)) {
       delay(1000);
       return;
     }
@@ -1520,8 +2152,14 @@ void loop() {
   
   int currentMinute = timeinfo.tm_min;
   
-  // Check if it's time to update
-  if (shouldUpdateNow(currentMinute)) {
+  // Check if it's time to update (skip auto-updates in debug mode if disabled)
+  #if DEBUG_MODE
+    bool shouldAutoUpdate = debugAutoRefresh && shouldUpdateNow(currentMinute);
+  #else
+    bool shouldAutoUpdate = shouldUpdateNow(currentMinute);
+  #endif
+  
+  if (shouldAutoUpdate) {
     lastCheckMinute = currentMinute;
     
     Serial.printf("\n[Scheduler] Wall-clock aligned update at %02d:%02d\n", 
@@ -1550,5 +2188,14 @@ void loop() {
   }
   
   // Check every 60 seconds (updates only happen at minute boundaries)
-  delay(60000);
+  // In debug mode, check for commands every second for responsive interaction
+  #if DEBUG_MODE
+    // Check for commands every second in debug mode (60 checks = 60 seconds)
+    for (int i = 0; i < 60; i++) {
+      handleDebugCommands();  // Check for commands every second
+      delay(1000);
+    }
+  #else
+    delay(60000);
+  #endif
 }

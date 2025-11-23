@@ -1,174 +1,145 @@
 # Changelog
 
-This document outlines the major changes between the original F1 Tracker code and the enhanced version (`F1_Tracker_3Color.ino`).
+All notable changes to the F1 Info Display Enhanced project will be documented in this file.
 
-## Removed Features
+## [Unreleased]
 
-### Web Server & Dashboard
-- **Removed:** Full web server implementation with HTML dashboard
-- **Removed:** mDNS support (`f1tracker.local` hostname)
-- **Removed:** Online dashboard showing:
-  - Season calendar
-  - All season rounds
-  - Pole positions
-  - Driver points
-  - Constructor standings
-- **Reason:** Focus shifted to e-paper display only, reducing code complexity and memory usage
+_No new changes yet - all recent changes moved to v1.1.0 below_
 
-### OTA (Over-The-Air) Updates
-- **Removed:** OTA update server functionality
-- **Removed:** Ability to update firmware via web interface or `f1tracker.local`
-- **Reason:** Simplified deployment model, updates now require USB connection
+## [1.1.0] - 2024-12-XX
 
-## Added Features
+### Added
 
-### Intelligent Update Scheduling
-- **Added:** Wall-clock aligned update scheduler
-- **Added:** Dynamic update frequency based on race proximity:
-  - >48 hours before race: Updates every 6 hours
-  - 24-48 hours before race: Updates every 2 hours
-  - <24 hours before race: Updates every 30 minutes (to catch starting grid)
-  - Race window (6h before to 6h after): Updates every 30 minutes
-  - After race: Returns to 2-hour updates
-- **Benefit:** Reduces unnecessary API calls while ensuring timely updates during race events
+#### Debug Mode
+- **Interactive Debug Mode** - Complete time simulation system for testing all display modes
+  - Set `DEBUG_MODE` to 1 to enable interactive testing
+  - Time offset simulation allows testing scenarios using past races
+  - All time calculations use simulated time while API calls use real time
+  - Display shows `[DEBUG] Mode X` indicator in header when in debug mode
+  - WiFi stays connected in debug mode for faster testing
+  - Auto-refresh disabled by default in debug mode (only updates on manual command)
 
-### Multi-Level Caching System
-- **Added:** Intelligent API response caching with TTL (Time To Live):
-  - Calendar cache: 1 hour TTL
-  - Standings cache: 1 hour TTL (invalidated when race finishes)
-  - Qualifying cache: 24 hours TTL (never changes once posted)
-  - Results cache: 1 hour TTL
-  - Availability cache: Separate caching for qualifying/results availability
-- **Benefit:** Reduces API calls by ~99%, improving reliability and reducing power consumption
+#### Interactive Debug Menu
+- **Numbered Menu System** - Easy-to-use menu with numbered options (1-8)
+  - Menu automatically displays on startup
+  - Menu reappears after each command completes
+  - Type numbers (1-8) or full commands - both work
+- **Menu Options:**
+  - `1` or `normal` - Jump to 3 days before race (Mode 1: Normal Operation)
+  - `2` or `before` - Jump to 2 hours before race (Mode 2: Race Approaching)
+  - `3` or `during` - Jump to race start time (Mode 3: Race In Progress)
+  - `4` or `after` - Jump to 5 hours after race start (Mode 4: Post-Race)
+  - `5` or `refresh` - Force immediate display update
+  - `6` or `status` - Show current offset, real time, simulated time, and race state
+  - `7` or `reset` - Reset to default offset (-30 days)
+  - `8` or `autorefresh` - Toggle auto-refresh on/off
+- **Time Adjustments** (also available):
+  - `+1h`, `+2h`, `+6h` - Add hours to time offset
+  - `-1h`, `-2h`, `-6h` - Subtract hours from time offset
+  - `+1d`, `+2d`, `+7d` - Add days to time offset
+  - `-1d`, `-2d`, `-7d` - Subtract days from time offset
+  - `set <seconds>` - Set exact time offset
+- **Menu Commands:**
+  - `menu` or `help` or `?` - Show menu again
 
-### Smart Display Modes
-- **Added:** Automatic display mode switching:
-  - Normal mode: Shows driver standings, constructor standings, and last race podium
-  - Race approaching (within 18h): Switches to starting grid view
-  - Race in progress: Shows "Race in Progress!" and current race grid
-  - Post-race: Shows results podium when available
-- **Added:** "Awaiting Results" display when next race is approaching
+#### Display Mode Improvements
+- **Mode 1: Normal Operation** - Driver standings, countdown, last race podium
+- **Mode 2: Race Approaching** - Starting grid, "Awaiting Results" message
+- **Mode 3: Race In Progress** - "Race in Progress!" indicator, starting grid, empty podium
+- **Mode 4: Post-Race** - Driver standings (when results available), podium with winners
 
-### Enhanced Race State Detection
-- **Added:** Real-time race state detection:
-  - Detects when race is in progress (0 to +4 hours from start)
-  - Detects race window (6 hours before to 6 hours after)
-  - Detects when next race is approaching (within 18 hours)
-- **Added:** Automatic podium clearing during race events
+### Fixed
 
-### Power Management
-- **Added:** WiFi power management:
-  - WiFi disconnects after updates to save power
-  - WiFi reconnects automatically when needed
-  - Display hibernates between updates
-- **Benefit:** Significantly reduced power consumption for battery-powered applications
+#### Scheduler Improvements
+- **Race State Detection** - Fixed scheduler to continue updates during and after race
+  - Added `lastRaceJustFinished` check that runs before checking `nextRaceEpoch`
+  - Ensures 30-minute updates continue for 4 hours after race start
+  - Handles case where race moves from "next" to "last" in API
+  - Prevents display from getting stuck at last update time
 
-### Improved Time Handling
-- **Added:** Local timezone conversion for race times
-- **Added:** Countdown timer showing days/hours until next race
-- **Added:** Formatted local date/time display (MM/DD format, 12-hour time)
-- **Added:** Persistent race epoch storage in Preferences
+#### Display Logic Fixes
+- **Grid vs Standings Display** - Fixed logic for when to show starting grid vs driver standings
+  - Grid shows: Before race (within 18h) OR during race until results available
+  - Driver standings show: After results become available
+  - Grid never shows after results are posted
+- **"Awaiting Results" Display** - Fixed to show "Awaiting Results" instead of countdown when grid is displayed
+  - Shows "Awaiting Results" in Next Race section when starting grid is active
+  - Properly indicates race is approaching and results are pending
+- **Mode 2 Podium Display** - Fixed to show blank podium with "Awaiting Results" instead of old race results
+  - Mode 2 (Race Approaching) now correctly hides previous race podium
+  - Shows empty podium boxes with "Awaiting Results" text
+- **Mode 3 Grid Display** - Fixed to always show starting grid during race
+  - Mode 3 (Race In Progress) now correctly displays grid regardless of qualifying data availability
+  - Handles race moving from nextRound to lastRound in API
+- **Mode 4 Detection** - Fixed "after" command to jump to 5 hours after race start
+  - Ensures Mode 4 is correctly detected (requires >4h past race and not in race window)
+  - Properly shows driver standings and podium with results
 
-### Better Error Handling
-- **Added:** HTTP retry logic with exponential backoff
-- **Added:** Graceful degradation on API failures
-- **Added:** Cache validation and fallback mechanisms
-- **Added:** WiFi reconnection logic with automatic restart on failure
+#### Serial Communication
+- **Enhanced Serial Output** - Added progress messages for debug commands
+  - Shows step-by-step progress during display refresh
+  - Indicates when WiFi is connecting, calendar is fetching, and display is refreshing
+  - Provides feedback that 15-30 second refresh time is normal for e-paper displays
+- **Interactive Menu System** - Menu displays automatically and after each command
+  - Shows numbered options for easy selection
+  - Displays current auto-refresh status
+  - Menu reappears after commands complete for continuous testing
 
-## Code Improvements
+### Changed
 
-### Memory Optimization
-- **Reduced:** JSON buffer from 16KB to 12KB (saves 4KB RAM)
-- **Added:** String pre-allocation to reduce fragmentation
-- **Added:** PROGMEM storage for API templates and logo data
-- **Result:** More efficient memory usage, better stability
+#### Time Management
+- **Simulated Time System** - New `getSimulatedTime()` and `getSimulatedLocalTime()` functions
+  - All race state detection uses simulated time in debug mode
+  - API calls continue to use real time for correct data fetching
+  - Time offset is configurable via `debugTimeOffsetSeconds` variable
 
-### Code Organization
-- **Improved:** Modular function structure
-- **Added:** Template functions for cached API calls
-- **Improved:** Clear separation of concerns (display, API, caching, scheduling)
-- **Added:** Comprehensive serial logging for debugging
+#### Code Organization
+- **Debug Mode Compilation** - All debug features compile out when `DEBUG_MODE = 0`
+  - No performance impact in production mode
+  - Clean separation between debug and production code
+- **Code Simplification** - Removed redundant mode detection calls from display functions
+  - DrawDrivers() and DrawLastRace() use simple timing checks
+  - Mode detection only used in DrawTime() for header display
+  - Reduced code complexity while maintaining functionality
 
-### Hardware Changes
+### Technical Details
 
-#### Pin Mapping (ESP32-C3)
-- **Changed:** Pin assignments optimized for ESP32-C3 Mini:
-  - BUSY: GPIO 4 (was GPIO 4)
-  - RST: GPIO 5 (was GPIO 16)
-  - DC: GPIO 7 (was GPIO 17)
-  - CS: GPIO 3 (was GPIO 5)
-  - SCK: GPIO 6 (was GPIO 18)
-  - MOSI: GPIO 10 (was GPIO 23)
-  - MISO: Removed (not needed for display)
+#### New Functions
+- `getSimulatedTime()` - Returns real time + offset in debug mode
+- `getSimulatedLocalTime()` - Populates timeinfo with simulated time
+- `getCurrentDisplayMode()` - Returns current display mode (1-4) in debug mode
+- `handleDebugCommands()` - Processes interactive serial commands
+- `printDebugMenu()` - Displays interactive menu with numbered options
 
-#### Board Support
-- **Changed:** Optimized for ESP32-C3 (from ESP32)
-- **Changed:** Partition scheme recommendation: "Huge APP (3MB No OTA)"
-- **Benefit:** Better power efficiency, smaller form factor support
+#### Modified Functions
+- `DrawDrivers()` - Simplified logic using timing checks (grid before/during race, standings otherwise)
+- `DrawLastRace()` - Fixed to show blank podium in Mode 2, results in Mode 4
+- `DrawNextRace()` - Added check for grid display to show "Awaiting Results"
+- `DrawTime()` - Shows `[DEBUG] Mode X` in header when debug mode enabled
+- `shouldUpdateNow()` - Added `lastRaceJustFinished` check for post-race updates
+- `disconnectWiFiIfIdle()` - Keeps WiFi connected in debug mode for faster testing
+- `loop()` - Checks for debug commands every second (instead of 60s) for responsive interaction
+- `setup()` - Added debug mode initialization and menu display
 
-## API Changes
+#### Constants and Variables
+- `DEBUG_MODE` - Compile-time flag to enable/disable debug mode
+- `debugTimeOffsetSeconds` - Runtime variable for time offset (default: -30 days)
+- `debugAutoRefresh` - Runtime flag to enable/disable auto-refresh in debug mode (default: false)
 
-### Endpoint Updates
-- **Changed:** API base URL now uses `api.jolpi.ca/ergast/f1/` proxy
-- **Added:** Dynamic year detection for API calls
-- **Improved:** API URL building with PROGMEM templates
+## [1.0.0] - Initial Release
 
-### Data Fetching
-- **Added:** JSON filtering to reduce payload size
-- **Added:** Cached API responses to reduce network traffic
-- **Improved:** Error handling and retry logic
+### Added
+- Race calendar display
+- Driver standings (top 10)
+- Constructor standings (top 5)
+- Starting grid display (when available)
+- Race results podium
+- Smart update scheduling based on race timing
+- Multi-level caching system
+- WiFi Manager for easy setup
+- Timezone support (EST/EDT default)
 
-## Display Improvements
+---
 
-### Layout Enhancements
-- **Added:** Red divider line in header
-- **Improved:** Text alignment and positioning
-- **Added:** Better podium visualization with proper spacing
-- **Added:** "Race in Progress!" indicator
-- **Improved:** Starting grid display formatting
-
-### Font and Rendering
-- **Maintained:** U8g2 font rendering system
-- **Improved:** Text width calculations for better alignment
-- **Added:** UTF-8 safe substring function for driver name abbreviations
-
-## Configuration Changes
-
-### WiFi Setup
-- **Changed:** WiFi AP SSID from "F1 display" to "F1Tracker-Setup"
-- **Maintained:** Password "formula1"
-- **Added:** Visual setup instructions on display during configuration
-- **Improved:** WiFiManager integration with callback for display updates
-
-### Timezone
-- **Changed:** Default timezone from BST (UK) to EST/EDT (USA)
-- **Maintained:** Easy timezone configuration via `MY_TZ` define
-
-## Performance Improvements
-
-- **Reduced:** API calls by ~99% through intelligent caching
-- **Reduced:** Power consumption through WiFi and display hibernation
-- **Improved:** Update reliability through retry logic and error handling
-- **Optimized:** Memory usage through buffer reduction and string management
-- **Faster:** Display updates through optimized drawing routines
-
-## Migration Notes
-
-### For Users Upgrading from Original Code
-
-1. **No Web Interface:** The web dashboard is no longer available. All information is displayed on the e-paper screen only.
-
-2. **No OTA Updates:** Firmware updates must be done via USB connection to the ESP32-C3.
-
-3. **Pin Changes:** If migrating from ESP32 to ESP32-C3, update your wiring according to the new pin mapping.
-
-4. **Partition Scheme:** Use "Huge APP (3MB No OTA)" partition scheme for best results.
-
-5. **WiFi Setup:** The WiFi setup process remains similar, but the AP name has changed to "F1Tracker-Setup".
-
-6. **Update Frequency:** The device now updates automatically based on race timing. Manual update intervals are no longer configurable (but can be modified in code if needed).
-
-## Summary
-
-The enhanced version focuses on creating a reliable, power-efficient e-paper display solution. By removing the web server and OTA functionality, the codebase is simpler, uses less memory, and consumes less power. The addition of intelligent scheduling and caching ensures the display stays up-to-date during important race events while minimizing unnecessary updates during off-seasons.
+**Note:** This changelog follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format.
 

@@ -94,48 +94,34 @@ On first boot, the device will create a WiFi access point:
 
 The display will show setup instructions during this process.
 
-## Display Information
-
-### Screen Layout
-
-```
-┌─────────────────────────────────┐
-│ Today: MM/DD/YYYY │ Updated: HH:MM│ ← Header (red divider)
-├─────────────────────────────────┤
-│ Next: [Race Name]               │
-│ Lights Out: MM/DD HH:MM - X hrs │ ← Next race info
-│                                  │
-│ Top 10 Drivers                  │ ← Driver standings
-│ 1 VER  2 HAM  3 PER ...         │
-│                                  │
-│ Top 5 Constructors               │
-│ 1 Red Bull  2 Mercedes ...       │
-│                                  │
-│        [F1 Logo]                 │ ← Podium section
-│      ┌───┐                       │
-│    ┌─┘ 1 └─┐                     │
-│  ┌─┘  2    └─┐                   │
-│ ┌┘    3      └┐                  │
-│   [Race Name]                     │
-└─────────────────────────────────┘
-```
 
 ### Display Modes
 
-**Normal Mode:**
+The display automatically switches between 4 modes based on race timing:
+
+**Mode 1: Normal Operation** (>18 hours before race):
 - Shows driver standings (top 10)
 - Shows constructor standings (top 5)
 - Shows last race podium (if results available)
+- Shows next race countdown
 
-**Race Approaching (within 18h):**
+**Mode 2: Race Approaching** (within 18h before race, grid available):
 - Switches to starting grid (qualifying positions)
+- Shows constructor standings (top 5)
 - Hides old podium, shows "Awaiting Results"
+- Shows next race info with "Awaiting Results" message
 
-**During Race (0 to +4 hours):**
+**Mode 3: Race In Progress** (race started, results not available yet):
 - Shows "Current Race: [Name]"
 - Shows "Race in Progress!"
-- Shows starting grid
-- Shows empty podium (no names)
+- Shows starting grid (continues during race)
+- Shows empty podium (no names, just boxes)
+
+**Mode 4: Post-Race** (results available):
+- Shows driver standings (switched from grid)
+- Shows constructor standings (top 5)
+- Shows last race podium with winner names
+- Shows next race information
 
 ![Race in Progress Screen](photos/inprogress.png)
 
@@ -209,6 +195,76 @@ const int UPDATE_INTERVAL_NORMAL_MIN = 120;     // Normal: 2 hours
 const int UPDATE_INTERVAL_RACE_WINDOW_MIN = 30; // Race window: 30 min
 const int UPDATE_INTERVAL_GRID_SEARCH_MIN = 30; // Grid search: 30 min
 ```
+
+### Debug Mode
+
+Debug mode allows you to test all display modes without waiting for actual race events. It simulates different times relative to a past race, allowing you to cycle through all scenarios interactively.
+
+#### Enabling Debug Mode
+
+1. Open `F1-Info-display-Enhanced.ino` in Arduino IDE
+2. Find line 42: `#define DEBUG_MODE 0`
+3. Change to: `#define DEBUG_MODE 1`
+4. Upload the code
+
+#### Using Debug Mode
+
+1. **Open Serial Monitor** (115200 baud)
+2. **Wait for initial setup** - Let the device connect to WiFi and fetch calendar data
+3. **Use interactive commands** to test different scenarios
+
+#### Interactive Menu
+
+When debug mode starts, an interactive menu is displayed. You can use either **numbers (1-8)** or **full commands**:
+
+**Menu Options:**
+- `1` or `normal` - Jump to 3 days before race (Mode 1: Normal Operation)
+- `2` or `before` - Jump to 2 hours before race (Mode 2: Race Approaching)
+- `3` or `during` - Jump to race start time (Mode 3: Race In Progress)
+- `4` or `after` - Jump to 5 hours after race start (Mode 4: Post-Race)
+- `5` or `refresh` - Force immediate display update
+- `6` or `status` - Show current offset, real time, simulated time, and race state
+- `7` or `reset` - Reset to default offset (-30 days)
+- `8` or `autorefresh` - Toggle auto-refresh on/off (default: OFF in debug mode)
+
+**Time Adjustments** (also available):
+- `+1h`, `+2h`, `+6h` - Add hours to time offset
+- `-1h`, `-2h`, `-6h` - Subtract hours from time offset
+- `+1d`, `+2d`, `+7d` - Add days to time offset
+- `-1d`, `-2d`, `-7d` - Subtract days from time offset
+- `set <seconds>` - Set exact time offset (e.g., `set -2592000`)
+
+**Menu Commands:**
+- `menu` or `help` or `?` - Show menu again
+
+#### Example Workflow
+
+```
+1. Upload code with DEBUG_MODE = 1
+2. Open Serial Monitor (115200 baud)
+3. Wait for calendar fetch
+4. Type "status" - see current state
+5. Type "normal" - see Mode 1 (driver standings, countdown)
+6. Type "before" - see Mode 2 (starting grid, awaiting results)
+7. Type "during" - see Mode 3 (race in progress, empty podium)
+8. Type "after" - see Mode 4 (post-race, results if available)
+```
+
+#### Important Notes
+
+- **Commands are case-insensitive** (e.g., `STATUS` = `status`)
+- **Serial Monitor settings:** 115200 baud, "Newline" or "Both NL & CR" line ending
+- **Display refresh takes 15-30 seconds** - this is normal for e-paper displays
+- **Menu reappears after commands** - After each mode command (1-4) or refresh (5) completes, the menu is shown again
+- **Auto-refresh disabled by default** - Display only updates when you select a menu option (1-5)
+- **WiFi stays connected** - In debug mode, WiFi remains connected for faster testing
+- **Jump commands auto-refresh** - Options 1-4 automatically update the display after jumping to that time
+- **Time adjustments don't refresh** - Use `+1h`, `-2h`, etc. then type `5` or `refresh` to update display
+- **API calls use real time** - Debug mode only affects time calculations, not API data
+
+#### Debug Mode Display Indicator
+
+When debug mode is enabled, the display shows `[DEBUG] Mode X` in the header (where X is 1-4) instead of `Today:` to indicate you're in test mode and show the current display mode.
 
 ## Power Consumption
 
@@ -288,10 +344,11 @@ const int UPDATE_INTERVAL_GRID_SEARCH_MIN = 30; // Grid search: 30 min
 
 ### Code Structure
 
-- **Main Loop:** Checks time every 10 seconds, triggers updates on schedule
+- **Main Loop:** Checks time every 60 seconds, triggers updates on schedule
 - **Update Function:** Fetches data, draws to display, hibernates
 - **Caching:** Multi-level cache reduces API calls
 - **Error Handling:** Graceful degradation on API failures
+- **Debug Mode:** Interactive time simulation for testing all display modes
 
 ## License
 

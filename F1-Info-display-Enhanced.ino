@@ -265,6 +265,13 @@ unsigned processedRound = 0;
 time_t   nextRaceEpoch   = 0;
 String   nextRaceDateStr;
 
+// ------------------- CACHED VALUES (optimization) ----------------------
+time_t   cachedLastRaceEpoch = 0;  // Cached lastRaceEpoch calculation
+time_t   cachedNowEpoch = 0;        // Cached current time (updated per cycle)
+unsigned cachedLastRaceRound = 0;  // Track when lastRaceEpoch was calculated
+unsigned cachedQualifyingRound = 0; // Track which round we checked qualifying for
+bool     cachedQualifyingAvailable = false; // Cached qualifying availability
+
 
 String buildApiUrl(const char* suffix) {
   struct tm currentTime;
@@ -465,22 +472,25 @@ bool isInRaceWindow() {
 
 // ------------------- HTTP ----------------------
 template <typename TFilterDoc>
-bool httpDeserializeWithFilter(Stream& s,
+bool httpDeserializeFromBuffer(const String& payload,
                                StaticJsonDocument<API_SCRATCH_DOC_SIZE>& target,
                                TFilterDoc* filter) {
+  if (payload.length() == 0) {
+    Serial.println(F("[ERR] HTTP body empty"));
+    return false;
+  }
+
+  DeserializationError err;
   if (filter) {
-    DeserializationError err =
-        deserializeJson(target, s, DeserializationOption::Filter(*filter));
-    if (err) {
-      Serial.printf("[ERR] JSON parse (filtered) failed: %s\n", err.c_str());
-      return false;
-    }
+    err = deserializeJson(target, payload, DeserializationOption::Filter(*filter));
   } else {
-    DeserializationError err = deserializeJson(target, s);
-    if (err) {
-      Serial.printf("[ERR] JSON parse failed: %s\n", err.c_str());
-      return false;
-    }
+    err = deserializeJson(target, payload);
+  }
+
+  if (err) {
+    Serial.printf("[ERR] JSON parse failed: %s (body %u bytes, heap %u)\n",
+                  err.c_str(), payload.length(), ESP.getFreeHeap());
+    return false;
   }
   return true;
 }
@@ -489,18 +499,17 @@ template <typename TFilterDoc>
 bool httpGetJsonRaw(const char* url, TFilterDoc* filter = nullptr) {
   // Ensure WiFi is connected before making API call
   ensureWiFiConnected();
-  
+
   doc.clear();
-  
 
   Serial.printf("\n--- HTTP Request ---\nAPI: %s\n", url);
 
   HTTPClient http;
-  http.useHTTP10(true);
   http.begin(url);
   http.setConnectTimeout(20000);
-  http.setTimeout(25000);
+  http.setTimeout(45000);
   http.addHeader("User-Agent", "F1Tracker/NanoESP32");
+  http.addHeader("Accept-Encoding", "identity");
 
   int httpCode = http.GET();
   Serial.printf("HTTP Status Code: %d\n", httpCode);
@@ -510,10 +519,25 @@ bool httpGetJsonRaw(const char* url, TFilterDoc* filter = nullptr) {
     return false;
   }
 
-  Serial.println(F("[STEP] net: Deserializing"));
-  
-  bool ok = httpDeserializeWithFilter(http.getStream(), doc, filter);
+  int expectedSize = http.getSize();
+  Serial.println(F("[STEP] net: Reading body"));
+  String payload;
+  if (expectedSize > 0) payload.reserve((size_t)expectedSize + 1);
+  payload = http.getString();
   http.end();
+
+  Serial.printf("[INFO] Received %u bytes", payload.length());
+  if (expectedSize > 0) Serial.printf(" (expected %d)", expectedSize);
+  Serial.println();
+
+  if (expectedSize > 0 && (int)payload.length() < expectedSize) {
+    Serial.printf("[ERR] Incomplete HTTP body (%u/%d bytes, heap %u)\n",
+                  payload.length(), expectedSize, ESP.getFreeHeap());
+    return false;
+  }
+
+  Serial.println(F("[STEP] net: Deserializing"));
+  bool ok = httpDeserializeFromBuffer(payload, doc, filter);
   if (!ok) return false;
 
   Serial.println(F("[INFO] JSON success."));
@@ -692,7 +716,8 @@ void configModeCallback(WiFiManager* myWiFiManager) {
 // ------------------- MODE DETECTION -------------------
 #if DEBUG_MODE
 int getCurrentDisplayMode() {
-  time_t nowEpoch = getSimulatedTime();
+  // Use cached time if available (optimization)
+  time_t nowEpoch = (cachedNowEpoch > 0) ? cachedNowEpoch : getSimulatedTime();
   
   // First, check if we have a next race scheduled
   if (nextRaceEpoch > 0 && nextRound > 0) {
@@ -743,7 +768,11 @@ int getCurrentDisplayMode() {
   // This prevents Mode 4 from showing when we're just in normal operation with old results
   if (lastRound > 0 && !isRaceInProgress() && !isInRaceWindow()) {
     // Check if we're more than 4 hours past the last race start
-    time_t lastRaceStartEpoch = isoUtcToEpoch(lastDate, lastTime);
+    // Use cached lastRaceEpoch if available (optimization)
+    if (cachedLastRaceEpoch == 0 && lastDate.length() > 0) {
+      cachedLastRaceEpoch = isoUtcToEpoch(lastDate, lastTime);
+    }
+    time_t lastRaceStartEpoch = cachedLastRaceEpoch;
     if (lastRaceStartEpoch > 0) {
       long diffSinceLastRace = nowEpoch - lastRaceStartEpoch;
       // Only show Mode 4 if we're well past the last race (more than 4 hours)
@@ -882,19 +911,39 @@ void FetchCalendar() {
     prefs.putULong64("nextEpoch", (uint64_t)nextRaceEpoch);
     prefs.putString("nextDate", nextRaceDateStr);
   }
+  // Note: We don't clear nextEpoch when nextRound is 0, as the scheduler
+  // uses it as a fallback to detect if a race just finished
   if (lastRound) {
     prefs.putUInt("lastRound", lastRound);
+    prefs.putString("lastDate", lastDate);
+    prefs.putString("lastTime", lastTime);
+    prefs.putString("lastGP", lastGP);
+    // Invalidate cached lastRaceEpoch when lastRound changes
+    if (cachedLastRaceRound != lastRound) {
+      cachedLastRaceEpoch = 0;
+      cachedLastRaceRound = lastRound;
+    }
+    // Invalidate cached lastRaceEpoch when lastRound changes
+    if (cachedLastRaceRound != lastRound) {
+      cachedLastRaceEpoch = 0;
+      cachedLastRaceRound = lastRound;
+    }
   }
 }
 
 // ------------------- DRAW LAST RACE -------------------
 void DrawLastRace(bool currentRaceInProgress) {
   unsigned int targetRound = lastRound;
-  time_t nowEpoch = getSimulatedTime();  // Use simulated time for logic
+  // Use cached time (optimization)
+  time_t nowEpoch = cachedNowEpoch;
   
   // Calculate timing values
   long diffToNext = nextRaceEpoch ? (long)(nextRaceEpoch - nowEpoch) : 999999;
-  time_t lastRaceStartEpoch = lastDate.length() > 0 ? isoUtcToEpoch(lastDate, lastTime) : 0;
+  // Use cached lastRaceEpoch if available (optimization)
+  if (cachedLastRaceEpoch == 0 && lastDate.length() > 0) {
+    cachedLastRaceEpoch = isoUtcToEpoch(lastDate, lastTime);
+  }
+  time_t lastRaceStartEpoch = cachedLastRaceEpoch;
   long diffSinceLastRace = lastRaceStartEpoch ? (nowEpoch - lastRaceStartEpoch) : 999999;
   
   // Check if we're within 18 hours of the NEXT race starting
@@ -1085,15 +1134,26 @@ void DrawNextRace() {
   gfx.setFont(u8g2_font_helvB08_tf);
   
   const int NEXT_RACE_MAX_WIDTH = 200;  // Only use left 200px, leave right side for drivers
+  
+  // Cache text widths for static strings (optimization)
+  static int cachedCurrentLabelW = -1;
+  static int cachedNextLabelW = -1;
+  static int cachedLoLabelW = -1;
+  static int cachedAwaitLabelW = -1;
+  
+  if (cachedCurrentLabelW < 0) {
+    cachedCurrentLabelW = textWidth("Current Race:");
+    cachedNextLabelW = textWidth("Next:");
+    cachedLoLabelW = textWidth("Lights Out:");
+    cachedAwaitLabelW = textWidth("Awaiting Results");
+  }
 
   // Check if race is currently in progress
   if (isRaceInProgress()) {
     // Show "Current Race:" instead of "Next:"
-    const char* currentLabel = "Current Race:";
-    int currentLabelW = textWidth(currentLabel);
-    drawStringRED(0, NEXT_LINE1_Y, currentLabel, LEFT);
-    display.fillRect(currentLabelW + 4, NEXT_LINE1_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - currentLabelW - 4, LINE_H, GxEPD_WHITE);
-    drawStringBLACK(currentLabelW + 4, NEXT_LINE1_Y, nextGP, LEFT);
+    drawStringRED(0, NEXT_LINE1_Y, "Current Race:", LEFT);
+    display.fillRect(cachedCurrentLabelW + 4, NEXT_LINE1_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - cachedCurrentLabelW - 4, LINE_H, GxEPD_WHITE);
+    drawStringBLACK(cachedCurrentLabelW + 4, NEXT_LINE1_Y, nextGP, LEFT);
     
     // Line 2: "Race in Progress!"
     drawStringRED(0, NEXT_LINE2_Y, "Race in Progress!", LEFT);
@@ -1103,34 +1163,31 @@ void DrawNextRace() {
   // Check if we're showing the starting grid (within 18h of race) - show "Awaiting Results" instead of countdown
   bool showingGrid = false;
   if (nextRaceEpoch > 0 && nextRound > 0) {
-    long diff = (long)(nextRaceEpoch - getSimulatedTime());  // Use simulated time for logic
+    // Use cached time (optimization)
+    long diff = (long)(nextRaceEpoch - cachedNowEpoch);
     if (diff > 0 && diff <= NEXT_RACE_APPROACHING_SEC && qualifyingAvailableForRound(nextRound)) {
       showingGrid = true;
     }
   }
 
   // Line 1: "Next:" + race name
-  const char* nextLabel = "Next:";
-  int nextLabelW = textWidth(nextLabel);
-  drawStringRED(0, NEXT_LINE1_Y, nextLabel, LEFT);
+  drawStringRED(0, NEXT_LINE1_Y, "Next:", LEFT);
   // Clear only the area we're writing to (left side only)
-  display.fillRect(nextLabelW + 4, NEXT_LINE1_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - nextLabelW - 4, LINE_H, GxEPD_WHITE);
-  drawStringBLACK(nextLabelW + 4, NEXT_LINE1_Y, nextGP, LEFT);
+  display.fillRect(cachedNextLabelW + 4, NEXT_LINE1_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - cachedNextLabelW - 4, LINE_H, GxEPD_WHITE);
+  drawStringBLACK(cachedNextLabelW + 4, NEXT_LINE1_Y, nextGP, LEFT);
 
   // Line 2: Show "Awaiting Results" if grid is showing, otherwise show countdown
   if (showingGrid) {
     // Grid is showing, so race is approaching - show "Awaiting Results"
-    const char* awaitLabel = "Awaiting Results";
-    drawStringRED(0, NEXT_LINE2_Y, awaitLabel, LEFT);
-    display.fillRect(textWidth(awaitLabel) + 4, NEXT_LINE2_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - textWidth(awaitLabel) - 4, LINE_H, GxEPD_WHITE);
+    drawStringRED(0, NEXT_LINE2_Y, "Awaiting Results", LEFT);
+    display.fillRect(cachedAwaitLabelW + 4, NEXT_LINE2_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - cachedAwaitLabelW - 4, LINE_H, GxEPD_WHITE);
   } else {
     // Normal countdown display
-    const char* loLabel = "Lights Out:";
-    int loW = textWidth(loLabel);
-    drawStringRED(0, NEXT_LINE2_Y, loLabel, LEFT);
+    drawStringRED(0, NEXT_LINE2_Y, "Lights Out:", LEFT);
 
     time_t epoch = nextRaceEpoch ? nextRaceEpoch : isoUtcToEpoch(nextDate, nextTime);
-    long diff = epoch ? (long)(epoch - getSimulatedTime()) : 0;  // Use simulated time for logic
+    // Use cached time (optimization)
+    long diff = epoch ? (long)(epoch - cachedNowEpoch) : 0;
 
     if (diff <= 0) {
       // This shouldn't happen now that we have isRaceInProgress() check above
@@ -1144,20 +1201,31 @@ void DrawNextRace() {
     String tLocal = nextRaceLocalTimeLower();
     String tMinus = nextRaceCountdownDH();
 
+    // Optimize string concatenation (reduce temporary objects)
     String tail;
-    tail.reserve(64);  // Pre-allocate to reduce fragmentation
-    if (dLocal.length()) tail += dLocal;
-    if (tLocal.length()) { 
-      tLocal.trim();
-      if (tail.length()) tail += " "; 
-      tail += tLocal; 
+    tail.reserve(80);  // Pre-allocate to reduce fragmentation (slightly larger for safety)
+    
+    // Build string more efficiently
+    bool needsSpace = false;
+    if (dLocal.length()) {
+      tail = dLocal;
+      needsSpace = true;
     }
-    if (tMinus.length()) { if (tail.length()) tail += " - "; tail += tMinus; }
+    if (tLocal.length()) {
+      tLocal.trim();
+      if (needsSpace) tail += " ";
+      tail += tLocal;
+      needsSpace = true;
+    }
+    if (tMinus.length()) {
+      if (needsSpace) tail += " - ";
+      tail += tMinus;
+    }
     tail.trim();
 
     // Clear only the area where countdown will be written (left side)
-    display.fillRect(loW + 4, NEXT_LINE2_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - loW - 4, LINE_H, GxEPD_WHITE);
-    drawStringBLACK(loW + 4, NEXT_LINE2_Y, tail, LEFT);
+    display.fillRect(cachedLoLabelW + 4, NEXT_LINE2_Y - (LINE_H - 10), NEXT_RACE_MAX_WIDTH - cachedLoLabelW - 4, LINE_H, GxEPD_WHITE);
+    drawStringBLACK(cachedLoLabelW + 4, NEXT_LINE2_Y, tail, LEFT);
   }
 }
 
@@ -1187,7 +1255,8 @@ void DrawDrivers() {
           // Even if qualifying not available, try to show grid for the race in progress
           // At race start, the race might still be in nextRound, or might have moved to lastRound
           // Check which one is the current race based on timing
-          time_t nowEpoch = getSimulatedTime();
+          // Use cached time (optimization)
+          time_t nowEpoch = cachedNowEpoch;
           if (nextRaceEpoch > 0) {
             long diffToNext = (long)(nextRaceEpoch - nowEpoch);
             // If we're at or past race start, the race might be in lastRound now
@@ -1220,7 +1289,8 @@ void DrawDrivers() {
     // Production mode logic
     // Check if we should show Starting Grid for the NEXT race (within 18h BEFORE race start)
     if (nextRaceEpoch > 0 && nextRound > 0) {
-      long diff = (long)(nextRaceEpoch - getSimulatedTime());
+      // Use cached time (optimization)
+      long diff = (long)(nextRaceEpoch - cachedNowEpoch);
       if (diff > 0 && diff <= NEXT_RACE_APPROACHING_SEC && qualifyingAvailableForRound(nextRound)) {
         showGrid = true;
         gridRound = nextRound;
@@ -1668,6 +1738,12 @@ void setup() {
   nextRound        = prefs.getUInt("nextRound", 0);
   nextRaceEpoch    = (time_t)prefs.getULong64("nextEpoch", 0);
   nextRaceDateStr  = prefs.getString("nextDate", "");
+  lastRound        = prefs.getUInt("lastRound", 0);
+  if (lastRound > 0) {
+    lastDate = prefs.getString("lastDate", "");
+    lastTime = prefs.getString("lastTime", "");
+    lastGP   = prefs.getString("lastGP", "");
+  }
 
   // Initial data fetch and display
   display.setFullWindow();
@@ -1676,6 +1752,15 @@ void setup() {
     display.fillScreen(GxEPD_WHITE);
     DrawTime();
     FetchCalendar();
+    
+    // Cache current time for this update cycle (optimization)
+    cachedNowEpoch = getSimulatedTime();
+    
+    // Invalidate cached lastRaceEpoch if lastRound changed
+    if (cachedLastRaceRound != lastRound) {
+      cachedLastRaceEpoch = 0;
+      cachedLastRaceRound = lastRound;
+    }
     
     bool raceIsInProgress = isRaceInProgress();
 
@@ -1703,6 +1788,15 @@ void fullRefreshAndReschedule() {
   // Update current time before drawing (uses simulated time in debug mode)
   getSimulatedLocalTime(&timeinfo);
   
+  // Cache current time for this update cycle (optimization)
+  cachedNowEpoch = getSimulatedTime();
+  
+  // Invalidate cached lastRaceEpoch if lastRound changed
+  if (cachedLastRaceRound != lastRound) {
+    cachedLastRaceEpoch = 0;
+    cachedLastRaceRound = lastRound;
+  }
+  
   display.setFullWindow();
   display.firstPage();
   do {
@@ -1727,16 +1821,39 @@ bool shouldUpdateNow(int currentMinute) {
     return false;
   }
   
-  time_t now = getSimulatedTime();  // Use simulated time for logic
+  // Use cached time if available, otherwise calculate (optimization)
+  time_t now = (cachedNowEpoch > 0) ? cachedNowEpoch : getSimulatedTime();
   
   // Check if last race just finished (within 4 hours) - need to check for results
   // This check must happen even if nextRaceEpoch is 0 (race moved from "next" to "last" in API)
   bool lastRaceJustFinished = false;
   if (lastRound > 0) {
-    time_t lastRaceStartEpoch = isoUtcToEpoch(lastDate, lastTime);
+    // Use cached lastRaceEpoch if available (optimization)
+    if (cachedLastRaceEpoch == 0 && lastDate.length() > 0) {
+      cachedLastRaceEpoch = isoUtcToEpoch(lastDate, lastTime);
+    }
+    time_t lastRaceStartEpoch = cachedLastRaceEpoch;
     if (lastRaceStartEpoch > 0) {
       long diffSinceLastRace = now - lastRaceStartEpoch;
       lastRaceJustFinished = (diffSinceLastRace >= 0 && diffSinceLastRace <= RACE_IN_PROGRESS_WINDOW_SEC);
+      if (lastRaceJustFinished) {
+        Serial.printf("[Scheduler] Last race finished %ld seconds ago (within 4h window)\n", diffSinceLastRace);
+      }
+    } else {
+      // Fallback: If we have lastRound but no lastDate/lastTime (calendar not fetched yet),
+      // check if the persisted nextEpoch was recently cleared (within last 4 hours)
+      // This handles the case where the race just finished and calendar hasn't been fetched yet
+      if (nextRaceEpoch == 0) {
+        time_t persistedNextEpoch = (time_t)prefs.getULong64("nextEpoch", 0);
+        if (persistedNextEpoch > 0) {
+          long diffSincePersistedRace = now - persistedNextEpoch;
+          // If persisted race was within last 4 hours, it might have just finished
+          if (diffSincePersistedRace >= 0 && diffSincePersistedRace <= RACE_IN_PROGRESS_WINDOW_SEC) {
+            lastRaceJustFinished = true;
+            Serial.printf("[Scheduler] Fallback: Using persisted nextEpoch (cleared %ld seconds ago)\n", diffSincePersistedRace);
+          }
+        }
+      }
     }
   }
   
@@ -1749,8 +1866,11 @@ bool shouldUpdateNow(int currentMinute) {
   }
   
   if (nextRaceEpoch == 0) {
-    // No next race scheduled, use normal 2-hour updates
+    // No next race scheduled
+    // But if we're still within 4 hours of last race, continue frequent updates (handled above)
+    // Otherwise use normal 2-hour updates
     if (currentMinute == 0 && (timeinfo.tm_hour % 2 == 0)) {
+      Serial.printf("[Scheduler] No next race - normal 2h update at hour %d\n", timeinfo.tm_hour);
       return true;
     }
     return false;

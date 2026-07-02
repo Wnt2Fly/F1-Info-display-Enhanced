@@ -4,7 +4,8 @@ All notable changes to the F1 Info Display Enhanced project will be documented i
 
 ## [Unreleased]
 
-_No new changes yet - all recent changes moved to v1.1.0 below_
+### Fixed
+- **HTTP JSON parsing reliability** - Buffer full API response before parsing instead of streaming directly from the TLS socket, fixing `IncompleteInput` errors on larger endpoints (race calendar, driver standings) over HTTPS
 
 ## [1.1.0] - 2024-12-XX
 

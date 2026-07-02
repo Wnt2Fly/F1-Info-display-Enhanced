@@ -216,22 +216,25 @@ time_t isoUtcToEpoch(const String& ymd, const String& hms) {
 
 // ------------------- HTTP ----------------------
 template <typename TFilterDoc>
-bool httpDeserializeWithFilter(Stream& s,
+bool httpDeserializeFromBuffer(const String& payload,
                                StaticJsonDocument<API_SCRATCH_DOC_SIZE>& target,
                                TFilterDoc* filter) {
+  if (payload.length() == 0) {
+    Serial.println(F("[ERR] HTTP body empty"));
+    return false;
+  }
+
+  DeserializationError err;
   if (filter) {
-    DeserializationError err =
-        deserializeJson(target, s, DeserializationOption::Filter(*filter));
-    if (err) {
-      Serial.printf("[ERR] JSON parse (filtered) failed: %s\n", err.c_str());
-      return false;
-    }
+    err = deserializeJson(target, payload, DeserializationOption::Filter(*filter));
   } else {
-    DeserializationError err = deserializeJson(target, s);
-    if (err) {
-      Serial.printf("[ERR] JSON parse failed: %s\n", err.c_str());
-      return false;
-    }
+    err = deserializeJson(target, payload);
+  }
+
+  if (err) {
+    Serial.printf("[ERR] JSON parse failed: %s (body %u bytes, heap %u)\n",
+                  err.c_str(), payload.length(), ESP.getFreeHeap());
+    return false;
   }
   return true;
 }
@@ -239,15 +242,15 @@ bool httpDeserializeWithFilter(Stream& s,
 template <typename TFilterDoc>
 bool httpGetJsonRaw(const char* url, TFilterDoc* filter = nullptr) {
   doc.clear();
-  
+
   Serial.printf("\n--- HTTP Request ---\nAPI: %s\n", url);
 
   HTTPClient http;
-  http.useHTTP10(true);
   http.begin(url);
   http.setConnectTimeout(20000);
-  http.setTimeout(25000);
+  http.setTimeout(45000);
   http.addHeader("User-Agent", "F1Tracker/NanoESP32");
+  http.addHeader("Accept-Encoding", "identity");
 
   int httpCode = http.GET();
   Serial.printf("HTTP Status Code: %d\n", httpCode);
@@ -257,10 +260,25 @@ bool httpGetJsonRaw(const char* url, TFilterDoc* filter = nullptr) {
     return false;
   }
 
-  Serial.println(F("[STEP] net: Deserializing"));
-  
-  bool ok = httpDeserializeWithFilter(http.getStream(), doc, filter);
+  int expectedSize = http.getSize();
+  Serial.println(F("[STEP] net: Reading body"));
+  String payload;
+  if (expectedSize > 0) payload.reserve((size_t)expectedSize + 1);
+  payload = http.getString();
   http.end();
+
+  Serial.printf("[INFO] Received %u bytes", payload.length());
+  if (expectedSize > 0) Serial.printf(" (expected %d)", expectedSize);
+  Serial.println();
+
+  if (expectedSize > 0 && (int)payload.length() < expectedSize) {
+    Serial.printf("[ERR] Incomplete HTTP body (%u/%d bytes, heap %u)\n",
+                  payload.length(), expectedSize, ESP.getFreeHeap());
+    return false;
+  }
+
+  Serial.println(F("[STEP] net: Deserializing"));
+  bool ok = httpDeserializeFromBuffer(payload, doc, filter);
   if (!ok) return false;
 
   Serial.println(F("[INFO] JSON success."));
